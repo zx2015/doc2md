@@ -4,6 +4,7 @@
 | :--- | :--- | :--- | :--- |
 | v1.0.0 | 2026-06-12 | Initial comprehensive system design for Doc2MD | Claude Fable 5 |
 | v1.0.1 | 2026-06-12 | Clarification: deployment & testing must run on x-server (VPN-only), all Python deps in shared `/media/data/venv` | Claude Fable 5 |
+| v1.0.2 | 2026-06-12 | LLM cleanup pipeline: add HybridChunker-based long-doc strategy with threshold routing, per-chunk degradation, and chunk-level progress | Claude Fable 5 |
 
 ---
 
@@ -147,6 +148,10 @@ erDiagram
         string llm_base_url
         string llm_api_key_encrypted
         string llm_model
+        int llm_context_window "默认 8192"
+        int llm_chunk_max_tokens "默认 4000, v1.0.2 新增"
+        int llm_chunk_concurrency "默认 3, v1.0.2 新增"
+        int llm_chunk_overlap_tokens "默认 200, v1.0.2 新增"
         boolean enable_toc_removal
         boolean enable_reference_removal
         boolean enable_header_footer_removal
@@ -188,7 +193,9 @@ erDiagram
     {
       "job_id": "8f830a6c-4861-460c-88e4-789a7101a0e1",
       "status": "PENDING",
-      "created_at": "2026-06-12T17:30:00Z"
+      "created_at": "2026-06-12T17:30:00Z",
+      "estimated_llm_calls": 12,            // v1.0.2 新增: 预估 LLM 调用次数 (阈值分流前)
+      "estimated_input_tokens": 48000       // v1.0.2 新增: 预估输入 token 总数
     }
     ```
 - **`GET /api/v1/jobs`**：
@@ -354,6 +361,34 @@ sequenceDiagram
 - **空白合并**：
   - 将连续三个及以上的换行符折叠为两个换行符。
   - 去除行尾多余的半角/全角空格。
+
+#### 5.2.4 长文档分块策略（HybridChunker + 阈值分流）⚠️ 2026-06-12 补充
+LLM 上下文窗口有限（典型 8K~128K token），大文档必须分块处理。设计要点：
+
+- **阈值分流（Threshold Routing）**：
+  - 调用 LLM 前，用 `tiktoken` 计算 `raw.md` 的 token 总数 `T_total`。
+  - 若 `T_total ≤ chunk_max_tokens`（默认 4000）→ 走"单次整体调用"路径，零切块开销。
+  - 若 `T_total > chunk_max_tokens` → 走"分块清洗"路径。
+- **分块器**：使用 Docling 原生 `HybridChunker`（`docling_core.transforms.chunker.hybrid_chunker.HybridChunker`）：
+  - `max_tokens = chunk_max_tokens`（默认 4000，留余量给 prompt 和 response）
+  - `merge_peers = True` 自动合并过小的相邻 chunk（避免一个标题被切成 3 段）
+  - `repeat_table_header = True` 表格被切断时重复表头
+  - 配合 `OpenAITokenizer`（基于 `tiktoken`）做 token 计数，与 LLM 调用方使用的 tokenizer 一致
+- **上下文注入**：使用 `chunker.contextualize(chunk)` 将分节标题（如 `# 第三章 实验结果`）前缀到每个 chunk 文本前面 → 解决"分块处丢上下文"的常见问题
+- **按块调用 LLM**：
+  - 对每个 chunk **独立**调用 LLM，prompt 强调"你只看到本文档的第 X/Y 个分块，标题是 Z。请只清洗当前块，**不要**基于此块推测其他块内容，也不要删除任何 chunk 边界的内容"
+  - 使用 **异步并发**（`asyncio.Semaphore(N)`，N 默认 3）调用，避免被 LLM 厂商限流，同时兼顾延迟
+- **降级策略**：
+  - 单 chunk 调用失败（超时 / 5xx / 解析错误）→ 降级为**仅规则后处理**该 chunk，并写 `jobs.options.warnings`
+  - 全部 chunk 都失败 → 整篇降级为纯规则后处理
+  - 降级不影响任务状态，仍返回 SUCCESS
+- **拼接输出**：按 `chunk.meta.doc_items` 的原始顺序拼接，保留标题层级、表格与列表
+- **可配置参数**（存入 `app_config`）：
+  - `llm_chunk_max_tokens` (int, 默认 4000)
+  - `llm_chunk_concurrency` (int, 默认 3)
+  - `llm_chunk_overlap_tokens` (int, 默认 200，跨块保留少量重叠避免切断句子)
+- **进度细化**：清洗阶段进度 = `(已完成 chunk 数 / 总 chunk 数) * 100`，让用户看到真实进度
+- **成本预估**：在 `POST /api/v1/jobs` 响应中预计算 `estimated_llm_calls` 与 `estimated_input_tokens` 返回给前端（基于已知的 chunk 数量）
 
 ---
 
