@@ -7,6 +7,9 @@ This directory contains design specifications, brainstorming outcomes, and syste
 ### specs/
 - [2026-06-12 Doc2MD Design](./specs/2026-06-12-doc2md-design.md) — Comprehensive system design covering architecture, data model, API, processing pipeline, frontend, and operational security.
 
+### plans/
+- [2026-06-12 Doc2MD Phase B+C Plan](./plans/2026-06-12-doc2md-phase-bc.md) — Step-by-step implementation plan for core document conversion (Phase B) and LLM-driven post-processing (Phase C).
+
 ## Related
 - [Architecture Overview](../design/ARCH_OVERVIEW.md)
 - [Design Index](../design/index.md)

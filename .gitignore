@@ -1,0 +1,36 @@
+# 本地知识库，不纳入版本控制
+.learnings/
+# Gemini 代理本地配置目录
+.gemini/
+# 本地环境配置（含密钥）
+.env
+.env.local
+.env.*.local
+# Docker 镜像与卷数据
+db_images.tar
+*.tar
+*.tar.gz
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+# Node / Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/npm-debug.log*
+frontend/yarn-debug.log*
+frontend/yarn-error.log*
+frontend/pnpm-debug.log*
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
