@@ -41,7 +41,7 @@ def run_docling_conversion(input_path: str, device_setting: str = "auto", progre
         doc = result.document
         
         # Export with embedded Base64 images for self-contained single-file Markdown
-        markdown_content = doc.export_to_markdown(image_ref_mode=ImageRefMode.EMBEDDED)
+        markdown_content = doc.export_to_markdown(image_mode=ImageRefMode.EMBEDDED)
         
         # Force PyTorch memory release immediately
         gc.collect()

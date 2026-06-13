@@ -51,6 +51,12 @@ def convert_task(job_id: str):
         # 2. Run Docling
         raw_md, result = run_docling_conversion(job.storage_input_path, device_setting=device_setting)
         
+        # [Log Addition] 显式将原生的 raw.md 保存到磁盘供溯源排查
+        job_dir = os.path.dirname(job.storage_input_path)
+        raw_md_path = os.path.join(job_dir, "raw.md")
+        with open(raw_md_path, "w", encoding="utf-8") as f:
+            f.write(raw_md)
+            
         image_count = len(re.findall(r'data:image/[a-zA-Z0-9]+;base64,', raw_md))
         estimated_vlm = image_count * 2
         
@@ -80,7 +86,7 @@ def convert_task(job_id: str):
             # Docling core conversion result provides the DoclingDocument
             from asgiref.sync import async_to_sync
             final_md = async_to_sync(clean_document_llm)(
-                doc=result.document,
+                raw_md=raw_md,
                 api_key=decrypted_key,
                 base_url=config.llm_base_url,
                 model=config.vlm_model if job.options.get('use_vlm_image_reconstruction', False) else config.llm_model,
@@ -93,7 +99,7 @@ def convert_task(job_id: str):
             )
                 
         # 5. Save output Markdown to file
-        out_path = job.storage_input_path.replace("input", "output.md")
+        out_path = os.path.join(job_dir, "output.md")
         with open(out_path, "w") as f:
             f.write(final_md)
             

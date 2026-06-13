@@ -124,3 +124,27 @@ After completing every user instruction, you must execute:
 1. **Next Steps Projection**: Analyze how the current change affects the system and deduce the next most critical task.
 2. **Status Audit**: Inspect `TODO.md` at the root, check off completed tasks, identify new to-dos, and highlight risks.
 3. **Proactive Recommendations**: Make professional suggestions regarding the next actions, technical obstacles to expect, or code/design optimization paths.
+
+---
+
+## 8. Deployment & Synchronization (CRITICAL)
+
+The workspace development environment is separated from the execution environment (`x-server`). When modifying code, you **MUST** synchronize your local changes to the remote server and restart the corresponding services before testing.
+
+- **Frontend Deployment**:
+  Whenever you modify the React frontend in `frontend/`, you must build and sync it:
+  ```bash
+  cd frontend
+  npm run build
+  rsync -avz dist/ x-server:/media/data/git/doc2md/frontend/dist/
+  ```
+
+- **Backend Deployment**:
+  Whenever you modify Python backend code in `backend/app/`, you must sync the files and restart the API service:
+  ```bash
+  rsync -avz /media/data/git/doc2md/backend/app/ x-server:/media/data/git/doc2md/backend/app/
+  ssh x-server "systemctl restart doc2md-api"
+  ```
+  *(If Celery worker tasks are modified, also restart the celery service if applicable).*
+
+**Failure to perform this `rsync` step will result in testing against outdated code on the server, leading to false negatives (like 404 Not Found for newly created endpoints).**
