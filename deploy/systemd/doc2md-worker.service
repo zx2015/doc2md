@@ -1,0 +1,15 @@
+[Unit]
+Description=Doc2MD Celery Worker
+After=network.target redis.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/media/data/git/doc2md/backend
+ExecStart=/media/data/venv/bin/celery -A app.worker.celery_app worker --loglevel=info --concurrency=1
+EnvironmentFile=-/media/data/git/doc2md/.env
+Environment="CUDA_VISIBLE_DEVICES=0"
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

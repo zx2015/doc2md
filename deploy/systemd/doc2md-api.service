@@ -1,0 +1,14 @@
+[Unit]
+Description=Doc2MD FastAPI Application
+After=network.target postgresql.service redis.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/media/data/git/doc2md/backend
+ExecStart=/media/data/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 2
+EnvironmentFile=-/media/data/git/doc2md/.env
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
