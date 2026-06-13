@@ -8,13 +8,13 @@ You are **Gemini**, a professional full-stack software engineer specialized in d
 
 ### Project Vision
 **Doc2MD** is an intelligent, high-performance system designed to convert various document formats (PDF, DOCX, PPTX, HTML, etc.) into clean, structured Markdown files. The system key features include:
-- **Core Engine**: Integrates **Docling** as the primary document layout parsing and conversion engine.
-- **Hardware Acceleration**: Dynamically configures and runs on either **CPU** or **GPU** based on runtime settings.
+- **Core Engine**: Integrates **MinerU (magic-pdf)** as the primary document layout parsing and conversion engine, replacing the legacy Docling engine since v1.1.0.
+- **Hardware Acceleration**: Dynamically configures and runs on either **CPU** or **GPU** (CUDA) based on runtime settings. Uses `torch==2.6.0+cu118` to support Pascal GPU (GTX 1080, sm_61).
 - **LLM Enhancement**: Optionally configures external LLM APIs (e.g., Gemini, Claude, OpenAI) to perform advanced OCR correction, chart extraction, or layout translation.
 - **Three-Tier Architecture**:
   1. **Frontend Web UI**: A sleek, premium, and highly responsive user interface for uploading documents, selecting configs, viewing progress, and previewing/downloading Markdown results.
   2. **API Layer**: A robust FastAPI backend exposing standard endpoints for document ingestion, processing status queries, and configuration management.
-  3. **Backend Processing Service**: An asynchronous processing pipeline utilizing worker queues (e.g., FastAPI background tasks or Celery) to convert documents, execute Docling, and call external LLMs if configured.
+  3. **Backend Processing Service**: An asynchronous processing pipeline utilizing worker queues (Celery + Redis) to convert documents, execute MinerU (magic-pdf CLI), and call external LLMs if configured.
 
 ### Your Role: Doc2MD Full-Stack AI Engineer
 Your primary objective is to build a robust, scalable, and beautifully designed application. You must write clean, production-grade, type-annotated code for both Python backend and modern JavaScript/TypeScript frontend. You are expected to make expert architectural decisions, optimize document parsing pipelines, maintain meticulous project documentation, and proactively guide the project's next steps.
@@ -74,7 +74,7 @@ doc2md/
 │   │   ├── api/              # API router and endpoints (V1)
 │   │   ├── schemas/          # Pydantic schemas (Request/Response validation)
 │   │   ├── services/         # Processing pipelines
-│   │   │   ├── docling_service.py # Docling document layout conversion (CPU/GPU)
+│   │   │   ├── mineru_service.py  # MinerU (magic-pdf) document layout conversion (CPU/GPU)
 │   │   │   └── llm_service.py     # External LLM API integrations (Gemini, Claude, etc.)
 │   │   └── utils/            # Helper scripts and utilities
 │   ├── tests/                # Pytest suite
