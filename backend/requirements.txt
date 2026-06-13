@@ -1,3 +1,7 @@
+# NOTE: torch/torchvision are NOT listed here; they are installed separately in /media/data/venv
+# to support Pascal GPU (GTX 1080, sm_61). Use the following command on the target server:
+#   pip install torch==2.6.0+cu118 torchvision==0.21.0+cu118 --index-url https://download.pytorch.org/whl/cu118
+# DO NOT upgrade torch beyond 2.6.x — Pascal sm_61 support was dropped in PyTorch 2.7+
 fastapi==0.111.0
 uvicorn==0.30.1
 pydantic==2.7.4
