@@ -23,6 +23,7 @@ async def clean_chunk(client: AsyncOpenAI, chunk_text: str, index: int, total: i
     2. 修正因 OCR 解析产生的拼接错误或断行，但绝对不能修改、润色或增删正文的核心原意。
     3. 保持 Markdown 格式完整性（特别是标题层级 #, ##，表格，列表）。
     4. 严格只返回清洗后的 Markdown 文本，不要包含任何旁白、解释或 ```markdown 标记。
+    5. 注意：部分文本块开头可能包含 `> [上下文: XXX > YYY]` 的辅助信息，这是为了帮助你理解当前段落的背景。在最终输出的文本中，**必须将这些辅助的上下文提示语彻底删除，不要保留它们**。
     {extra_prompt}
     """
 
@@ -115,61 +116,47 @@ async def reconstruct_image_vlm(
         # 降级：如果重构失败，保持原 Base64 标签
         return f"![Figure]({image_url})"
 
-async def process_embedded_images(
-    markdown_text: str, 
-    client: AsyncOpenAI, 
-    model: str, 
-    keep_original: bool
-) -> str:
-    # 正则匹配 Markdown 中的 Base64 内联图片
-    pattern = r'!\[.*?\]\(data:image\/(?P<ext>png|jpeg|webp);base64,(?P<data>[A-Za-z0-9+/=]+)\)'
-    
-    matches = list(re.finditer(pattern, markdown_text))
-    if not matches:
-        return markdown_text
-        
-    # 提取所有图片并去重（避免同一张图重复调用）
-    unique_images = {}
-    for m in matches:
-        ext = m.group("ext")
-        data = m.group("data").strip()
-        full_match = m.group(0)
-        if data not in unique_images:
-            unique_images[data] = {"ext": ext, "full_match": full_match}
-
-    # 并发重构
-    semaphore = asyncio.Semaphore(2) # 限制图像并发，防止速率限制
-    async def sem_reconstruct(data, ext, full_match):
-        async with semaphore:
-            reconstructed = await reconstruct_image_vlm(client, data, ext, model, keep_original)
-            return full_match, reconstructed
-
-    tasks = [sem_reconstruct(data, info["ext"], info["full_match"]) for data, info in unique_images.items()]
-    results = await asyncio.gather(*tasks)
-    
-    # 替换原 Markdown 文本
-    for full_match, reconstructed in results:
-        markdown_text = markdown_text.replace(full_match, reconstructed)
-        
-    return markdown_text
-
 def chunk_markdown(text: str, max_tokens: int) -> list[str]:
     enc = tiktoken.get_encoding("cl100k_base")
     paragraphs = text.split("\n\n")
     chunks = []
     current_chunk = []
     current_length = 0
+    hierarchy = {}
+    
     for p in paragraphs:
+        # 追踪标题层级
+        heading_match = re.match(r'^(#{1,6})\s+(.*)$', p.strip())
+        if heading_match:
+            level = len(heading_match.group(1))
+            title = heading_match.group(2).strip()
+            hierarchy[level] = title
+            # 清理更深层级的过时标题
+            for l in list(hierarchy.keys()):
+                if l > level:
+                    del hierarchy[l]
+                    
         p_len = len(enc.encode(p))
+        
+        # 如果当前块将超出限制，则截断保存
         if current_length + p_len > max_tokens and current_chunk:
             chunks.append("\n\n".join(current_chunk))
-            current_chunk = [p]
-            current_length = p_len
+            
+            # 为新区块注入上下文的面包屑导航
+            context_header = []
+            if hierarchy:
+                breadcrumbs = " > ".join([hierarchy[k] for k in sorted(hierarchy.keys())])
+                context_header.append(f"> [上下文: {breadcrumbs}]")
+            
+            current_chunk = context_header + [p] if context_header else [p]
+            current_length = len(enc.encode("\n\n".join(current_chunk)))
         else:
             current_chunk.append(p)
             current_length += p_len
+            
     if current_chunk:
         chunks.append("\n\n".join(current_chunk))
+        
     return chunks
 
 async def clean_document_llm(

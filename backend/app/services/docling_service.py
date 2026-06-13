@@ -13,14 +13,15 @@ def resolve_device(device_setting: str) -> str:
     # auto
     return "cuda" if torch.cuda.is_available() else "cpu"
 
-def run_docling_conversion(input_path: str, device_setting: str = "auto", progress_callback=None) -> tuple:
+def run_docling_conversion(input_path: str, device_setting: str = "auto", do_ocr: bool = True, progress_callback=None) -> tuple:
     device = resolve_device(device_setting)
     
     # Configure Pipeline
     pipeline_options = PdfPipelineOptions()
     pipeline_options.accelerator_options = AcceleratorOptions(device=device)
-    pipeline_options.do_ocr = True
-    pipeline_options.ocr_options = RapidOcrOptions()
+    pipeline_options.do_ocr = do_ocr
+    if do_ocr:
+        pipeline_options.ocr_options = RapidOcrOptions()
     pipeline_options.generate_picture_images = True # Patch 12.1: 必须开启提取图片
     pipeline_options.generate_page_images = False
     

@@ -49,7 +49,9 @@ def convert_task(job_id: str):
         use_llm_cleanup = True # assuming global enable or derived from options
         
         # 2. Run Docling
-        raw_md, result = run_docling_conversion(job.storage_input_path, device_setting=device_setting)
+        # 默认关闭强制 OCR，以防数字版 PDF 原生文字被 LayoutLM 误识别为图像而覆盖丢失
+        do_ocr = job.options.get("do_ocr", False) if job.options else False
+        raw_md, result = run_docling_conversion(job.storage_input_path, device_setting=device_setting, do_ocr=do_ocr)
         
         # [Log Addition] 显式将原生的 raw.md 保存到磁盘供溯源排查
         job_dir = os.path.dirname(job.storage_input_path)
