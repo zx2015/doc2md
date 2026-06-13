@@ -11,6 +11,7 @@
 | v1.0.6 | 2026-06-12 | Configuration: remove upload file size limit (unlimited) | Claude Fable 5 |
 | v1.0.7 | 2026-06-12 | Fix: add generate_picture_images config in §5.1; add disk guard & stream upload & auto-cleanup in §7.2; add estimated_vlm_calls & vlm_image stage in §4; add snapshot frame spec in §4.2.3; deprecate enable_toc/ref_removal fields; update Phase C summary | Claude Fable 5 |
 | v1.1.0 | 2026-06-13 | **Engine migration**: replace Docling with MinerU (magic-pdf) as core parsing engine; update §1.1, §2, §3, §5.1, §6.1.3, §7.1, §7.2, §7.3, §8; MinerU uses magic-pdf CLI + rglob output discovery | Gemini CLI |
+| v1.2.0 | 2026-06-14 | **批量上传**：前端预览队列 + 顺序上传方案；更新 §6.1.1 首页交互规范；后端 API 无需改动 | Gemini CLI |
 
 ---
 
@@ -580,26 +581,64 @@ LLM 拿到该上下文后，**禁止**基于"上一块/下一块"是否存在来
 ### 6.1 核心页面与交互流
 
 #### 6.1.1 首页 (Dashboard)
-- **拖拽上传区 (DropZone)**：
-  - 采用极简的虚线框设计，支持单文件、多文件拖拽，或者选择文件夹上传。
-  - 限制上传格式（白名单：PDF、DOCX、PPTX、XLSX、HTML、EPUB、PNG、JPG、TIFF 等，以 MinerU 实际支持的格式为准，PDF 为主要支持格式）。
-- **转换选项面板 (Accordion 折叠)**：
-  - 允许用户在上传前或上传后，自定义该批次任务的清理选项（勾选框与下拉菜单）：
-    - [ ] 启用 LLM 智能清洗（勾选后激活 LLM 管道，默认使用 Balanced 档，接管 TOC/References 剔除）
-    - **LLM 清洗档位** (下拉选择，仅在勾选 LLM 智能清洗后可用)：
-      - `Conservative` (保守)：仅做"去页眉页脚页码 + 拼接修复"，**不**做 TOC/References 剔除
-      - `Balanced` (平衡，默认推荐)：包含 Conservative，且让 LLM 智能剔除真正的 TOC/References 块，遵循"宁可漏删不要误杀"原则
-      - `Aggressive` (激进)：包含 Balanced，且允许 LLM 主动对部分 OCR 拼写错误进行句式重构与改写
-    - [ ] 规则合并冗余空白（始终可用，合并连续 3+ 换行符，去除行尾空格）
+
+##### 6.1.1.1 拖拽上传区 (DropZone) ⚠️ v1.2.0 更新：支持多文件批量上传
+- 采用极简的虚线框设计，支持**多文件同时拖拽**或点击选择（`<input multiple>`）。
+- 限制上传格式（白名单：PDF、DOCX、PPTX、PNG、JPG、JPEG 等，以 MinerU 实际支持的格式为准，PDF 为主要支持格式）。
+- 用户选择文件后，**不立即上传**，而是先将所有文件加入本地「待处理队列」预览区。
+
+##### 6.1.1.2 批量上传预览队列 (Upload Queue) ⚠️ v1.2.0 新增
+用户在点击「开始转换」前，先在预览队列中确认、调整文件列表：
+
+- **队列展示**：以列表形式展示所有待上传文件，每行显示：
+  - 文件名、大小
+  - 行内「移除」按钮（可从队列中删除单个文件）
+  - 状态标识：`待上传` / `上传中` / `已入队` / `失败`
+- **全局操作**：
+  - 「+ 继续添加文件」按钮：追加更多文件到队列
+  - 「清空队列」按钮：清除所有待上传文件
+  - **「开始转换」按钮**：触发顺序上传流程（见 §6.1.1.3）
+- **转换选项**：选项面板（LLM 清洗、设备选择等）应用于此次批量任务的**所有文件**
+
+##### 6.1.1.3 顺序上传流程 (Sequential Upload) ⚠️ v1.2.0 新增
+
+> **核心原则**：一次只上传一个文件，上传+入队成功后再上传下一个，避免大文件并发冲击带宽和服务器。
+
+```
+用户点击「开始转换」
+  ├── 禁用「开始转换」按钮，防止重复提交
+  └── 遍历队列中的每个文件（按顺序）:
+        ├── 将该文件行状态更新为「上传中 ⟳」
+        ├── POST /api/v1/jobs（单文件 + options）
+        ├── 成功 → 状态更新为「已入队 ✓」，记录返回的 job_id
+        │         → 该 job 立即出现在下方「任务看板」中（PENDING 状态）
+        ├── 失败 → 状态更新为「失败 ✗」+ 错误原因（如格式不支持、磁盘不足）
+        │         → 记录错误，**不中断**，继续上传下一个文件
+        └── 全部处理完毕 → 显示汇总：N 个成功入队 / M 个失败
+```
+
+**失败重试**：队列中失败的文件行右侧显示「重试」按钮，点击后单独重新上传该文件。
+
+**幂等保护**：每个文件的上传都是独立的 `POST /api/v1/jobs` 请求，后端无状态，天然幂等。
+
+##### 6.1.1.4 转换选项面板 (Options Panel)
+- 允许用户在上传前自定义该批次所有任务的清理选项（勾选框与下拉菜单）：
+  - [ ] 启用 LLM 智能清洗（勾选后激活 LLM 管道，默认使用 Balanced 档，接管 TOC/References 剔除）
+  - **LLM 清洗档位** (下拉选择，仅在勾选 LLM 智能清洗后可用)：
+    - `Conservative` (保守)：仅做"去页眉页脚页码 + 拼接修复"，**不**做 TOC/References 剔除
+    - `Balanced` (平衡，默认推荐)：包含 Conservative，且让 LLM 智能剔除真正的 TOC/References 块，遵循"宁可漏删不要误杀"原则
+    - `Aggressive` (激进)：包含 Balanced，且允许 LLM 主动对部分 OCR 拼写错误进行句式重构与改写
+  - [ ] 规则合并冗余空白（始终可用，合并连续 3+ 换行符，去除行尾空格）
   - 硬件设备选择：下拉菜单（Auto / CUDA GPU / CPU）。
-- **任务看板 (Job List)**：
-  - 采用卡片式或表格化展示历史任务。
-  - 实时显示任务状态徽章：
-    - `PENDING`：灰色沙漏。
-    - `RUNNING`：蓝色旋转加载动画，并带有实时进度条和阶段文字（如 "OCR 阶段: 3/12 页"）。
-    - `SUCCESS`：绿色勾选。
-    - `FAILED`：红色警告，悬浮显示错误摘要。
-  - 操作按钮：查看结果（仅 SUCCESS 可用）、流式下载、删除任务、取消任务（仅 PENDING/RUNNING 可用）。
+
+##### 6.1.1.5 任务看板 (Job List)
+- 采用卡片式或表格化展示历史任务（来自 `GET /api/v1/jobs`）。
+- 实时显示任务状态徽章：
+  - `PENDING`：灰色沙漏 — 排队中，等待 Worker 处理。
+  - `RUNNING`：蓝色旋转加载动画，并带有实时进度条和阶段文字（如 "OCR 阶段: 3/12 页"）。
+  - `SUCCESS`：绿色勾选。
+  - `FAILED`：红色警告，悬浮显示错误摘要。
+- 操作按钮：查看结果（仅 SUCCESS 可用）、流式下载、删除任务、取消任务（仅 PENDING/RUNNING 可用）。
 
 #### 6.1.2 详情预览页 (Job Detail)
 - **双栏布局**：

@@ -1382,6 +1382,209 @@ doc2md/
 
 ---
 
+## Phase D — Task 13: 批量上传（前端预览队列 + 顺序上传）
+
+> **版本**: v1.2.0 | **日期**: 2026-06-14 | **后端改动**: 无
+
+### 13.1 设计原则回顾
+
+本实现采用**方案三**（前端预览队列 + 顺序上传）：
+- 复用现有 `POST /api/v1/jobs` 单文件 API，后端**零改动**
+- 前端管理本地上传队列，**依次**（非并发）上传每个文件
+- 一个文件上传成功入队后，再上传下一个
+
+### 13.2 前端状态设计
+
+```typescript
+// 队列中每个文件的状态
+type QueueItem = {
+  id: string;            // 本地唯一 ID（crypto.randomUUID()）
+  file: File;            // 原始 File 对象
+  status: 'pending'      // 待上传
+         | 'uploading'   // 上传中
+         | 'queued'      // 已成功入队（job_id 已获取）
+         | 'failed';     // 上传失败
+  jobId?: string;        // 成功后的 job_id
+  error?: string;        // 失败原因
+};
+
+// Dashboard 新增状态
+const [uploadQueue, setUploadQueue] = useState<QueueItem[]>([]);
+const [isUploading, setIsUploading] = useState(false);  // 防止重复提交
+```
+
+### 13.3 前端组件改动（`Dashboard.tsx`）
+
+#### 13.3.1 DropZone — 多文件选择
+
+```tsx
+// 原：单文件
+<input type="file" onChange={(e) => setFile(e.target.files?.[0])} />
+
+// 改：多文件，加入队列而非立即上传
+<input
+  type="file"
+  multiple
+  accept=".pdf,.docx,.pptx,.png,.jpg,.jpeg"
+  onChange={(e) => {
+    const files = Array.from(e.target.files || []);
+    const newItems: QueueItem[] = files.map(f => ({
+      id: crypto.randomUUID(),
+      file: f,
+      status: 'pending',
+    }));
+    setUploadQueue(prev => [...prev, ...newItems]);
+    e.target.value = ''; // 清空 input，允许重复选同名文件
+  }}
+/>
+```
+
+拖拽支持同理：`onDrop` 时将 `event.dataTransfer.files` 转为队列项追加。
+
+#### 13.3.2 Upload Queue 预览列表
+
+```tsx
+{uploadQueue.length > 0 && (
+  <div className="upload-queue">
+    <div className="queue-header">
+      <span>{uploadQueue.length} 个文件待转换</span>
+      <button onClick={() => setUploadQueue([])} disabled={isUploading}>
+        清空队列
+      </button>
+    </div>
+
+    {uploadQueue.map(item => (
+      <div key={item.id} className="queue-item">
+        {/* 状态图标 */}
+        {item.status === 'pending'   && <span className="icon-pending">○</span>}
+        {item.status === 'uploading' && <span className="icon-uploading">⟳</span>}
+        {item.status === 'queued'    && <span className="icon-queued text-green-500">✓</span>}
+        {item.status === 'failed'    && <span className="icon-failed text-red-500">✗</span>}
+
+        {/* 文件信息 */}
+        <span className="filename">{item.file.name}</span>
+        <span className="filesize">{(item.file.size / 1024 / 1024).toFixed(1)} MB</span>
+
+        {/* 错误信息 */}
+        {item.status === 'failed' && (
+          <span className="error-msg text-red-400 text-xs">{item.error}</span>
+        )}
+
+        {/* 操作按钮 */}
+        {item.status === 'pending' && !isUploading && (
+          <button onClick={() => removeFromQueue(item.id)}>移除</button>
+        )}
+        {item.status === 'failed' && !isUploading && (
+          <button onClick={() => retryItem(item.id)}>重试</button>
+        )}
+      </div>
+    ))}
+
+    {/* 底部操作 */}
+    <div className="queue-actions">
+      <label className="add-more-btn">
+        + 继续添加文件
+        <input type="file" multiple hidden onChange={handleAddMore} />
+      </label>
+      <button
+        className="start-btn"
+        onClick={startSequentialUpload}
+        disabled={isUploading || uploadQueue.filter(i => i.status === 'pending').length === 0}
+      >
+        {isUploading ? '上传中...' : '开始转换'}
+      </button>
+    </div>
+  </div>
+)}
+```
+
+#### 13.3.3 顺序上传核心逻辑
+
+```typescript
+const startSequentialUpload = async () => {
+  setIsUploading(true);
+  const pendingItems = uploadQueue.filter(i => i.status === 'pending');
+
+  for (const item of pendingItems) {
+    // 1. 标记为上传中
+    updateQueueItem(item.id, { status: 'uploading' });
+
+    try {
+      // 2. 构造 FormData，逐文件上传
+      const formData = new FormData();
+      formData.append('file', item.file);
+      formData.append('options', JSON.stringify(buildOptions())); // 当前面板配置
+
+      const res = await fetch('/api/v1/jobs', {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!res.ok) {
+        const err = await res.text();
+        throw new Error(`HTTP ${res.status}: ${err}`);
+      }
+
+      const data = await res.json();
+
+      // 3. 成功：记录 job_id，状态改为已入队
+      updateQueueItem(item.id, { status: 'queued', jobId: data.job_id });
+
+    } catch (e: any) {
+      // 4. 失败：记录错误，继续下一个
+      updateQueueItem(item.id, { status: 'failed', error: e.message });
+    }
+  }
+
+  setIsUploading(false);
+  // 5. 刷新任务看板
+  fetchJobs();
+};
+
+// 辅助：更新队列中某项状态
+const updateQueueItem = (id: string, patch: Partial<QueueItem>) => {
+  setUploadQueue(prev =>
+    prev.map(i => i.id === id ? { ...i, ...patch } : i)
+  );
+};
+
+// 辅助：单个文件重试
+const retryItem = async (id: string) => {
+  updateQueueItem(id, { status: 'pending', error: undefined });
+  // 触发单文件顺序上传
+  const item = uploadQueue.find(i => i.id === id);
+  if (!item) return;
+  // 复用 startSequentialUpload 逻辑，但只处理该一项
+  await startSequentialUpload(); // 自动跳过非 pending 项
+};
+```
+
+### 13.4 验收标准
+
+| 场景 | 预期行为 |
+|------|----------|
+| 拖入 3 个 PDF | 队列显示 3 行，状态均为「待上传」，不自动开始 |
+| 点击「开始转换」 | 文件逐一变为「上传中」→「已入队」，任务看板依次出现 3 个 PENDING 任务 |
+| 第 2 个文件格式不支持 | 状态变为「失败」+ 显示原因，第 3 个文件继续正常上传 |
+| 失败文件点击「重试」 | 仅该文件重新上传，其他已入队文件不受影响 |
+| 上传过程中点「清空队列」 | 按钮 disabled，无法操作（`isUploading=true` 期间） |
+| 上传完毕 | `isUploading=false`，「开始转换」按钮恢复可用 |
+| 已入队的文件 | 不再显示「移除」按钮（上传已完成，无需操作） |
+
+### 13.5 部署步骤
+
+```bash
+# 本地构建
+cd /media/data/git/doc2md/frontend
+npm run build
+
+# 同步到 x-server
+rsync -avz dist/ x-server:/media/data/git/doc2md/frontend/dist/
+```
+
+---
+
 ## Related
-- [Comprehensive Design Spec](../specs/2026-06-12-doc2md-design.md) (v1.1.0)
+- [Comprehensive Design Spec](../specs/2026-06-12-doc2md-design.md) (v1.2.0)
 - [Architecture Overview](../../design/ARCH_OVERVIEW.md)
+
