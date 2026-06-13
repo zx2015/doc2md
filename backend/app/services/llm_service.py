@@ -1,13 +1,11 @@
 import asyncio
 import tiktoken
 from openai import AsyncOpenAI
-from docling_core.transforms.chunker.hybrid_chunker import HybridChunker
-from docling_core.types.doc.document import DoclingDocument
 from app.services.cleanup import collapse_whitespace
 import re
 
-async def clean_chunk(client: AsyncOpenAI, chunk_text: str, index: int, total: int, model: str, aggressiveness: str) -> str:
-    if aggressiveness == "conservative":
+async def clean_chunk(client: AsyncOpenAI, chunk_text: str, index: int, total: int, model: str, aggressiveness: int) -> str:
+    if aggressiveness == 1:
         # Conservative bypasses TOC/References removal prompt
         extra_prompt = ""
     else:
@@ -20,7 +18,7 @@ async def clean_chunk(client: AsyncOpenAI, chunk_text: str, index: int, total: i
 
     system_prompt = f"""你是一个专业的文档编辑专家。你的任务是清洗以下 Markdown 文本分块：
     1. 去除所有不属于正文的冗余信息，包括：页眉、页脚、页码。
-    2. 修正因 OCR 解析产生的拼接错误或断行，但绝对不能修改、润色或增删正文的核心原意。
+    2. 修正因 OCR 解析产生的拼接错误或断行。除补回漏字外，绝对不能修改、润色或增删正文的核心原意。
     3. 保持 Markdown 格式完整性（特别是标题层级 #, ##，表格，列表）。
     4. 严格只返回清洗后的 Markdown 文本，不要包含任何旁白、解释或 ```markdown 标记。
     5. 注意：部分文本块开头可能包含 `> [上下文: XXX > YYY]` 的辅助信息，这是为了帮助你理解当前段落的背景。在最终输出的文本中，**必须将这些辅助的上下文提示语彻底删除，不要保留它们**。
@@ -45,11 +43,25 @@ async def clean_chunk(client: AsyncOpenAI, chunk_text: str, index: int, total: i
 
 async def reconstruct_image_vlm(
     client: AsyncOpenAI, 
-    base_64_data: str, 
+    abs_path: str, 
     ext: str, 
     model: str, 
-    keep_original: bool
+    keep_original: bool,
+    rel_url: str = ""
 ) -> str:
+    import base64
+    import os
+    
+    # Check if the file exists
+    if not os.path.exists(abs_path):
+        return f"![Image Not Found]({rel_url})"
+        
+    try:
+        with open(abs_path, "rb") as image_file:
+            base_64_data = base64.b64encode(image_file.read()).decode('utf-8')
+    except Exception:
+        return f"![Image Error]({rel_url})"
+        
     image_url = f"data:image/{ext};base64,{base_64_data}"
     
     # 步骤 1: 图像分类器 (Classifier Channel)
@@ -110,11 +122,15 @@ async def reconstruct_image_vlm(
         )
         reconstructed_text = reconstruct_resp.choices[0].message.content.strip()
         
-        # 彻底替换，抛弃冗余的 Base64
-        return f"\n\n{reconstructed_text}\n\n"
+        # 将原图链接附在后面？用户说要把 description 插入到上下文。
+        # 我们可以保留原图并在其下方加上描述
+        if keep_original:
+            return f"\n\n![{label}]({rel_url})\n\n> **AI Vision:** {reconstructed_text}\n\n"
+        else:
+            return f"\n\n{reconstructed_text}\n\n"
     except Exception:
-        # 降级：如果重构失败，保持原 Base64 标签
-        return f"![Figure]({image_url})"
+        # 降级：如果重构失败，保持原图片链接
+        return f"![Figure]({rel_url})"
 
 def chunk_markdown(text: str, max_tokens: int) -> list[str]:
     enc = tiktoken.get_encoding("cl100k_base")
@@ -159,34 +175,48 @@ def chunk_markdown(text: str, max_tokens: int) -> list[str]:
         
     return chunks
 
+
+
 async def clean_document_llm(
-    raw_md: str, 
-    api_key: str, 
-    base_url: str, 
-    model: str, 
-    aggressiveness: str = "balanced",
-    max_tokens: int = 4000,
+    raw_md: str,
+    job_dir: str = "",
+    api_key: str = "",
+    base_url: str = "",
+    model: str = "gpt-4o-mini",
+    aggressiveness: int = 1,
+    max_tokens: int = 2048,
     concurrency: int = 3,
+    progress_callback: callable = None,
     use_vlm: bool = False,
-    keep_original_images: bool = True,
-    progress_callback=None
+    keep_original_images: bool = False,
+    prompt_extension: str = ""
 ) -> str:
-    # 步骤 1: 提取 Base64 图片并使用唯一占位符替换
-    # 增强正则表达式的鲁棒性：允许未知的扩展名、忽略标题属性，以及兼容带有空白符或换行的 Base64 编码
-    pattern = r'!\[(.*?)\]\((data:image\/(?P<ext>[a-zA-Z0-9]+);base64,(?P<data>[A-Za-z0-9+/=]+))(?:[\s]+"([^"]*)")?\)'
-    matches = list(re.finditer(pattern, raw_md))
+    """
+    Cleans raw markdown from MinerU by chunking and sending to LLM.
+    Also handles VLM image reconstruction via DOC2MD_IMG_xxx.
+    """
+
+    # 1. 提取本地图片链接并使用唯一占位符替换
+    # 匹配 MinerU 输出的图片链接：![alt](images/xxx.jpg)
+    import os
+    pattern = r'!\[(.*?)\]\((images\/[^\)]+\.(?P<ext>jpg|png|jpeg))(?:\s+"([^"]*)")?\)'
+    matches = list(re.finditer(pattern, raw_md, re.IGNORECASE))
     
     image_dict = {}
     placeholder_md = raw_md
     
     for i, m in enumerate(matches):
         placeholder = f"![image_placeholder](DOC2MD_IMG_{i})"
+        rel_path = m.group(2)
+        ext = m.group("ext").lower()
+        abs_path = os.path.join(job_dir, rel_path) if job_dir else rel_path
+        
         image_dict[placeholder] = {
             "full_match": m.group(0),
             "alt": m.group(1),
-            "url": m.group(2),
-            "ext": m.group(3),
-            "data": m.group(4)
+            "url": rel_path,
+            "abs_path": abs_path,
+            "ext": ext
         }
         placeholder_md = placeholder_md.replace(m.group(0), placeholder)
 
@@ -221,7 +251,14 @@ async def clean_document_llm(
         semaphore = asyncio.Semaphore(2)
         async def sem_reconstruct(placeholder, info):
             async with semaphore:
-                reconstructed = await reconstruct_image_vlm(client, info["data"], info["ext"], model, keep_original_images)
+                reconstructed = await reconstruct_image_vlm(
+                    client, 
+                    abs_path=info["abs_path"], 
+                    ext=info["ext"], 
+                    model=model, 
+                    keep_original=keep_original_images,
+                    rel_url=info["url"]
+                )
                 return placeholder, reconstructed
                 
         vlm_tasks = [sem_reconstruct(ph, info) for ph, info in image_dict.items()]
@@ -230,7 +267,7 @@ async def clean_document_llm(
         for placeholder, reconstructed in vlm_results:
             cleaned_md = cleaned_md.replace(placeholder, reconstructed)
     else:
-        # 如果未开启 VLM，直接将原 Base64 拼回
+        # 如果未开启 VLM，直接将原图片链接还原
         for placeholder, info in image_dict.items():
             cleaned_md = cleaned_md.replace(placeholder, info["full_match"])
 

@@ -23,7 +23,8 @@ class AppConfig(Base):
     enable_whitespace_cleanup = Column(Boolean, default=True)
     device = Column(String, default="auto")  # cuda, cpu, auto
     ocr_timeout_seconds = Column(Integer, default=600)
-    docling_options = Column(JSON, default=dict)
+    docling_options = Column(JSON, default=dict, comment="⚠️ deprecated since v1.1.0")
+    mineru_options = Column(JSON, default=dict, comment="MinerU execution options")
     storage_retention_days = Column(Integer, default=7)
     disk_free_min_gb = Column(Integer, default=2)
     updated_at = Column(DateTime, default=None, onupdate=func.now())

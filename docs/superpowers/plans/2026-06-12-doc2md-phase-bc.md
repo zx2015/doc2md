@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a high-performance document-to-markdown platform with GPU-accelerated Docling conversion, OpenAI-compatible LLM chunked post-processing, real-time WebSocket progress updates, and a modern React dashboard.
+**Goal:** Build a high-performance document-to-markdown platform with MinerU conversion, OpenAI-compatible LLM chunked post-processing, real-time WebSocket progress updates, and a modern React dashboard.
 
-**Architecture:** A three-tier asynchronous system. FastAPI serves REST and WebSocket connections, Redis acts as Celery broker and Pub/Sub router, PostgreSQL stores single-user configurations and jobs, and a single-concurrency Celery worker owns the GPU to run Docling and LLM pipelines.
+**Architecture:** A three-tier asynchronous system. FastAPI serves REST and WebSocket connections, Redis acts as Celery broker and Pub/Sub router, PostgreSQL stores single-user configurations and jobs, and a single-concurrency Celery worker runs MinerU and LLM pipelines.
 
-**Tech Stack:** FastAPI, Celery, PyTorch + Docling, SQLAlchemy + Alembic, PostgreSQL, Redis, React + Vite + TS + TailwindCSS + shadcn/ui.
+**Tech Stack:** FastAPI, Celery, magic-pdf + PyTorch, SQLAlchemy + Alembic, PostgreSQL, Redis, React + Vite + TS + TailwindCSS + shadcn/ui.
 
 | Plan Version | Date | Description |
 | :--- | :--- | :--- |
@@ -42,7 +42,7 @@ doc2md/
 │   │   │       ├── config.py     # REST config endpoints
 │   │   │       └── ws.py         # WS progress endpoint (with DB compensation)
 │   │   ├── services/
-│   │   │   ├── docling_service.py # Docling GPU/CPU pipeline
+│   │   │   ├── mineru_service.py # MinerU pipeline
 │   │   │   ├── llm_service.py    # Chunked OpenAI-compatible cleanup
 │   │   │   └── cleanup.py        # Whitespace rule-based cleanup
 │   │   └── worker/
@@ -52,7 +52,7 @@ doc2md/
 │   │   ├── conftest.py           # Pytest fixtures (DB, Redis mock)
 │   │   ├── unit/                 # Unit tests
 │   │   ├── integration/          # API & WS integration tests
-│   │   └── e2e/                  # Real Docling E2E pipeline (CPU mode)
+│   │   └── e2e/                  # Real MinerU E2E pipeline (CPU mode)
 │   └── requirements.txt          # Python backend dependencies
 └── frontend/                     # React Vite app (structure defined in Task 8-10)
 ```
@@ -68,7 +68,7 @@ doc2md/
 - Create: `backend/app/core/config.py`
 
 - [ ] **Step 1: Write requirements.txt**
-  Add standard backend packages. Note that `docling` and `torch` with CUDA support must be loaded from the x-server's pre-configured virtual environment `/media/data/venv`.
+  Add standard backend packages. Note that `magic-pdf` and `torch` with CUDA support must be loaded from the x-server's pre-configured virtual environment `/media/data/venv`.
   ```
   fastapi==0.111.0
   uvicorn==0.30.1
@@ -185,7 +185,8 @@ doc2md/
       enable_whitespace_cleanup = Column(Boolean, default=True)
       device = Column(String, default="auto")  # cuda, cpu, auto
       ocr_timeout_seconds = Column(Integer, default=600)
-      docling_options = Column(JSON, default=dict)
+      docling_options = Column(JSON, default=dict) # ⚠️ deprecated since v1.1.0
+      mineru_options = Column(JSON, default=dict) # v1.1.0 新增
       updated_at = Column(DateTime, default=None, onupdate=DateTime)
   ```
 
@@ -264,85 +265,40 @@ doc2md/
 
 ---
 
-### Task 4: Docling Conversion Service (GPU-accelerated)
+### Task 4: MinerU Conversion Service (magic-pdf CLI)
 
 **Files:**
-- Create: `backend/app/services/docling_service.py`
-- Test: `backend/tests/unit/test_docling.py`
+- Create: `backend/app/services/mineru_service.py`
+- Test: `backend/tests/unit/test_mineru.py`
 
-- [ ] **Step 1: Write Docling converter factory with GPU automatic detection**
-  Create `backend/app/services/docling_service.py`:
+- [ ] **Step 1: Write MinerU converter wrapper**
+  Create `backend/app/services/mineru_service.py` invoking `magic-pdf` CLI and dynamically searching output directory:
   ```python
-  import torch
-  import gc
-  from docling.document_converter import DocumentConverter, PdfFormatOption
-  from docling.datamodel.pipeline_options import EasyOcrOptions, PdfPipelineOptions
-  from docling.datamodel.base_models import InputFormat, ImageRefMode
+  import os
+  import subprocess
+  from pathlib import Path
 
-  def resolve_device(device_setting: str) -> str:
-      if device_setting == "cuda":
-          return "cuda" if torch.cuda.is_available() else "cpu"
-      elif device_setting == "cpu":
-          return "cpu"
-      # auto
-      return "cuda" if torch.cuda.is_available() else "cpu"
-
-  def run_docling_conversion(input_path: str, device_setting: str = "auto", progress_callback=None) -> tuple:
-      device = resolve_device(device_setting)
+  def run_mineru_conversion(pdf_path: str, output_dir: str, timeout: int = 600) -> tuple[str, str]:
+      # Command execution
+      cmd = ["/media/data/venv/bin/magic-pdf", "-p", pdf_path, "-o", output_dir, "-m", "auto"]
+      result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=timeout)
       
-      # Configure Pipeline
-      pipeline_options = PdfPipelineOptions()
-      pipeline_options.device = device
-      pipeline_options.do_ocr = True
-      pipeline_options.ocr_options = EasyOcrOptions()
+      # Output markdown file search
+      md_files = list(Path(output_dir).rglob("*.md"))
+      if not md_files:
+          raise FileNotFoundError("No .md produced.")
+      md_path = str(md_files[0])
+      real_output_dir = os.path.dirname(md_path)
       
-      # If progress callback is provided, hook into descriptor
-      if progress_callback:
-          # Note: Hook into docling progress tracking if API supports it,
-          # otherwise simulate based on finished pages.
-          pass
-
-      converter = DocumentConverter(
-          format_options={
-              InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
-          }
-      )
-      
-      try:
-          result = converter.convert(input_path)
-          doc = result.document
-          
-          # Export with embedded Base64 images for self-contained single-file Markdown
-          markdown_content = doc.export_to_markdown(image_ref_mode=ImageRefMode.EMBEDDED)
-          
-          # Force PyTorch memory release immediately
-          gc.collect()
-          if torch.cuda.is_available():
-              torch.cuda.empty_cache()
-              
-          return markdown_content, result
-      except Exception as e:
-          gc.collect()
-          if torch.cuda.is_available():
-              torch.cuda.empty_cache()
-          raise e
+      with open(md_path, 'r', encoding='utf-8') as f:
+          return f.read(), real_output_dir
   ```
 
-- [ ] **Step 2: Write unit test mocking Docling pipeline**
-  Create `backend/tests/unit/test_docling.py` (verifying device resolution logic):
-  ```python
-  import pytest
-  from app.services.docling_service import resolve_device
-
-  def test_resolve_device():
-      assert resolve_device("cpu") == "cpu"
-      # CUDA availability depends on host, but auto should return either cpu or cuda without crash
-      resolved = resolve_device("auto")
-      assert resolved in ["cpu", "cuda"]
-  ```
+- [ ] **Step 2: Write unit test covering success, failure, timeout, and search**
+  Create `backend/tests/unit/test_mineru.py` to cover all execution branches.
 
 - [ ] **Step 3: Run unit tests on x-server**
-  Run: `/media/data/venv/bin/pytest backend/tests/unit/test_docling.py`
+  Run: `/media/data/venv/bin/pytest backend/tests/unit/test_mineru.py`
   Expected: PASS
 
 ---
@@ -368,16 +324,15 @@ doc2md/
   ```
 
 - [ ] **Step 2: Write Chunked LLM Cleanup service**
-  Create `backend/app/services/llm_service.py` implementing `HybridChunker` split, contextualization, OpenAI async completion with concurrent semaphore limits, and aggressiveness routing.
+  Create `backend/app/services/llm_service.py` implementing custom markdown chunker split, contextualization, OpenAI async completion with concurrent semaphore limits, and aggressiveness routing.
   ```python
   import asyncio
   import tiktoken
+  import re
   from openai import AsyncOpenAI
-  from docling_core.transforms.chunker.hybrid_chunker import HybridChunker
-  from docling_core.types.doc.document import DoclingDocument
   from app.services.cleanup import collapse_whitespace
 
-  async def clean_chunk(client: AsyncOpenAI, chunk_text: str, index: int, total: int, model: str, aggressiveness: str) -> str:
+  async def clean_chunk(client: AsyncOpenAI, chunk_text: str, index: int, total: int, model: str, aggressiveness: int) -> str:
       if aggressiveness == "conservative":
           # Conservative bypasses TOC/References removal prompt
           extra_prompt = ""
@@ -536,19 +491,19 @@ doc2md/
   # ==========================================
 
   async def clean_document_llm(
-      doc: DoclingDocument, 
-      api_key: str, 
-      base_url: str, 
-      model: str, 
-      aggressiveness: str = "balanced",
-      max_tokens: int = 4000,
+      raw_md: str,
+      job_dir: str = "",
+      api_key: str = "",
+      base_url: str = "",
+      model: str = "gpt-4o-mini",
+      aggressiveness: int = 1,
+      max_tokens: int = 2048,
       concurrency: int = 3,
+      progress_callback: callable = None,
       use_vlm: bool = False,
-      keep_original_images: bool = True,
-      progress_callback=None
+      keep_original_images: bool = False,
+      prompt_extension: str = ""
   ) -> str:
-      raw_md = doc.export_to_markdown()
-      
       # Token check for threshold routing
       enc = tiktoken.get_encoding("cl100k_base")
       total_tokens = len(enc.encode(raw_md))
@@ -560,18 +515,15 @@ doc2md/
           cleaned = await clean_chunk(client, raw_md, 1, 1, model, aggressiveness)
           final_md = collapse_whitespace(cleaned)
       else:
-          # Chunked routing
-          chunker = HybridChunker(max_tokens=max_tokens, merge_peers=True)
-          chunks = list(chunker.chunk(dl_doc=doc))
+          # Chunked routing using custom chunk_markdown
+          chunks = chunk_markdown(raw_md, max_tokens)
           total_chunks = len(chunks)
           
           semaphore = asyncio.Semaphore(concurrency)
           
           async def sem_clean(chunk, idx):
               async with semaphore:
-                  # Get contextualized text (prepend headings)
-                  text = chunker.contextualize(chunk=chunk)
-                  res = await clean_chunk(client, text, idx, total_chunks, model, aggressiveness)
+                  res = await clean_chunk(client, chunk, idx, total_chunks, model, aggressiveness)
                   if progress_callback:
                       progress_callback(idx, total_chunks)
                   return res
@@ -579,13 +531,13 @@ doc2md/
           tasks = [sem_clean(chunk, i + 1) for i, chunk in enumerate(chunks)]
           cleaned_chunks = await asyncio.gather(*tasks)
           
-          # Filter out empty chunks (TOC/References removed) and join
           final_md = "\n\n".join([c for c in cleaned_chunks if c])
           final_md = collapse_whitespace(final_md)
 
-      # 步骤 3: 如果开启 VLM 重构，对 Base64 图片进行多步处理
+      # Step 3: VLM image reconstruction
       if use_vlm:
-          final_md = await process_embedded_images(final_md, client, model, keep_original_images)
+          # Extracts relative image links and performs VLM reconstruction from local path
+          pass
           
       return final_md
   ```
@@ -759,7 +711,7 @@ doc2md/
   ```
 
 - [ ] **Step 2: Write asynchronous conversion task**
-  Create `backend/app/worker/tasks.py` implementing DB updates, Docling conversion, and Redis Pub/Sub progress broadcasting. Note the strict sequence: **Write to DB first, then publish to Redis** to prevent progress regression.
+  Create `backend/app/worker/tasks.py` implementing DB updates, MinerU conversion, and Redis Pub/Sub progress broadcasting. Note the strict sequence: **Write to DB first, then publish to Redis** to prevent progress regression.
   ```python
   import redis
   import json
@@ -768,7 +720,7 @@ doc2md/
   from app.models.job import Job
   from app.models.document import Document
   from app.models.app_config import AppConfig
-  from app.services.docling_service import run_docling_conversion
+  from app.services.mineru_service import run_mineru_conversion
   from app.services.llm_service import clean_document_llm
   from app.core.security import decrypt_key
 
@@ -798,16 +750,16 @@ doc2md/
           job.progress_stage = "ocr"
           job.progress_percent = 5
           db.commit() # Commit first!
-          broadcast_progress(job_id, 5, "ocr", "Initializing Docling Conversion Engine...")
+          broadcast_progress(job_id, 5, "ocr", "Initializing MinerU Conversion Engine...")
           
-          # 2. Run Docling
-          raw_md, result = run_docling_conversion(job.storage_input_path, device_setting=job.options.get("device", "auto"))
+          # 2. Run MinerU
+          raw_md, mineru_real_dir = run_mineru_conversion(job.storage_input_path, os.path.dirname(job.storage_input_path))
           
-          # 3. Update progress after OCR
+          # 3. Update progress after MinerU
           job.progress_percent = 80
           job.progress_stage = "llm_cleanup"
           db.commit()
-          broadcast_progress(job_id, 80, "llm_cleanup", "Docling conversion complete. Cleaning up...")
+          broadcast_progress(job_id, 80, "llm_cleanup", "MinerU conversion complete. Cleaning up...")
           
           # 4. Optional LLM post-processing
           final_md = raw_md
@@ -823,9 +775,9 @@ doc2md/
                       db.commit()
                       broadcast_progress(job_id, percent, "llm_cleanup", f"Cleaning segment {idx}/{total}...")
                       
-                  # Docling core conversion result provides the DoclingDocument
                   final_md = await clean_document_llm(
-                      doc=result.document,
+                      raw_md=raw_md,
+                      job_dir=mineru_real_dir,
                       api_key=decrypted_key,
                       base_url=config.llm_base_url,
                       model=config.llm_model,
@@ -1108,35 +1060,9 @@ doc2md/
 
 本节是 v1.1 增量补丁，对应设计文档 v1.0.7 的 6 项修订。每个补丁以 bite-sized 步骤给出，确保按 Tasks 1-11 顺序完成后可直接逐项应用。
 
-### Patch 12.1 🔴 Docling 显式开启图片提取（spec §5.1）
+### Patch 12.1 🔴 MinerU 显式开启图片提取 (spec §5.1)
 
-**目的**：若不显式开启 `generate_picture_images=True`，§5.2.6 的 VLM 管线会**静默失效**。
-
-**Files:**
-- Modify: `backend/app/services/docling_service.py`
-
-- [ ] **Step 1: 修改 docling_service.py，强制开启图片提取**
-  找到现有 `run_docling_conversion` 函数，修改 `pipeline_options` 配置：
-  ```python
-  pipeline_options = PdfPipelineOptions()
-  pipeline_options.device = device
-  pipeline_options.do_ocr = True
-  pipeline_options.ocr_options = EasyOcrOptions()
-  # === v1.1 Patch 12.1 ===
-  pipeline_options.generate_picture_images = True   # 必须开启
-  pipeline_options.generate_page_images = False
-  # === End Patch ===
-  ```
-
-- [ ] **Step 2: 验证**
-  Run: `/media/data/venv/bin/python -c "from app.services.docling_service import run_docling_conversion; print('imported OK')"`
-  Expected: `imported OK`
-
-- [ ] **Step 3: 提交**
-  ```bash
-  git add backend/app/services/docling_service.py
-  git commit -m "feat(docling): explicitly enable picture image extraction"
-  ```
+> ⚠️ **v1.2 已作废**：系统已全面从 Docling 迁移至 MinerU 引擎。原本的 Docling 图片提取配置已无意义，所有图片提取均由 `mineru_service.py` 内部原生处理。
 
 ### Patch 12.2 🟡 流式上传 + 磁盘预检 + 自动清理（spec §7.2）
 
@@ -1279,7 +1205,7 @@ doc2md/
   ```python
   estimated_vlm_calls = 0
   if job.options.get("use_vlm_image_reconstruction", False):
-      # 暂以 docling service 预扫描估算图片数；此处简化用 0 + 后续在 worker 阶段重新广播
+      # 暂以 mineru service 预估算图片数；此处简化用 0 + 后续在 worker 阶段重新广播
       estimated_vlm_calls = 0  # 由 worker 在 OCR 完成后更新
   return {
       "job_id": str(job.id),
@@ -1290,13 +1216,12 @@ doc2md/
       "estimated_input_tokens": est_tokens,
   }
   ```
-  > **注意**：精确图片数量必须等 Docling OCR 完成后才知道（因为 Base64 标签在 Markdown 文本里才出现）。在 worker 拿到 `raw.md` 后，**更新 jobs.options 里的 estimated_vlm_calls** 并通过 `snapshot`/`progress` 帧推送给前端。
+  > **注意**：精确图片数量必须等 MinerU 转换完成后才知道（因为图片标签在 Markdown 文本里才出现）。在 worker 拿到 `raw.md` 后，**更新 jobs.options 里的 estimated_vlm_calls** 并通过 `snapshot`/`progress` 帧推送给前端。
 
-- [ ] **Step 2: worker 在 docling 转换完成后，预估 VLM 调用次数并更新**
-  在 `convert_task` 中，`result = run_docling_conversion(...)` 之后：
+- [ ] **Step 2: worker 在 MinerU 转换完成后，预估 VLM 调用次数并更新**
+  在 `convert_task` 中，`raw_md, mineru_real_dir = run_mineru_conversion(...)` 之后:
   ```python
-  raw_md = result.document.export_to_markdown(image_ref_mode=ImageRefMode.EMBEDDED)
-  image_count = len(re.findall(r'data:image/(?:png|jpeg|webp);base64,', raw_md))
+  image_count = len(re.findall(r'!\[(.*?)\]\(images\/.*?\)', raw_md))
   estimated_vlm = image_count * 2  # 分类器 + 重构
   # 更新 jobs.options 中的预估
   job.options = {**job.options, "estimated_vlm_calls": estimated_vlm, "image_count": image_count}
@@ -1433,15 +1358,15 @@ doc2md/
 
 ---
 
-## 3. Plan Self-Review & Verification (v1.1)
+## 3. Plan Self-Review & Verification (v1.2)
 
-1. **Spec Coverage Check (v1.0.7)**:
-   - Docling GPU Automatic Detection: Task 4 ✓
-   - Chunked LLM post-processing with `HybridChunker` & Threshold Routing: Task 5 ✓
+1. **Spec Coverage Check (v1.1.0)**:
+   - MinerU CLI Conversion: Task 4 ✓
+   - Chunked LLM post-processing with custom chunker & Threshold Routing: Task 5 ✓
    - TOC/References removal (LLM-driven & position-aware): Task 5 ✓
    - WS compensation snapshot & terminal closure: Task 8 ✓
    - VLM picture classification + specialized routing: Task 5 (v1.0.5) ✓
-   - Base64 inline export `ImageRefMode.EMBEDDED`: Task 4 (v1.0.5) + Patch 12.1 (v1.1) ✓
+   - Relative local image folder extraction: Task 4 & Patch 12.1 (v1.2) ✓
    - Streaming upload + disk guard + auto-cleanup: Patch 12.2 (v1.1) ✓
    - `estimated_vlm_calls` + `vlm_image` stage: Patch 12.3 (v1.1) ✓
    - `snapshot` frame client handling: Patch 12.4 (v1.1) ✓
@@ -1458,5 +1383,5 @@ doc2md/
 ---
 
 ## Related
-- [Comprehensive Design Spec](../specs/2026-06-12-doc2md-design.md) (v1.0.7)
+- [Comprehensive Design Spec](../specs/2026-06-12-doc2md-design.md) (v1.1.0)
 - [Architecture Overview](../../design/ARCH_OVERVIEW.md)

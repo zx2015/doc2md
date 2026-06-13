@@ -57,7 +57,11 @@ export default function Dashboard({ onJobComplete }: { onJobComplete?: (jobId: s
     jobId ? `${wsProtocol}//${window.location.host}/api/v1/ws/jobs/${jobId}` : null,
     {
       onOpen: () => console.log('WS connected'),
-      shouldReconnect: () => true,
+      shouldReconnect: () => {
+        return status === 'PENDING' || status === 'RUNNING';
+      },
+      reconnectAttempts: 10,
+      reconnectInterval: (attempt) => Math.min(30000, 1000 * 2 ** attempt),
     }
   );
 
@@ -66,8 +70,12 @@ export default function Dashboard({ onJobComplete }: { onJobComplete?: (jobId: s
       const data = lastJsonMessage as any;
       if (data.type === 'snapshot' || data.type === 'progress') {
         setProgress(data.percent || 0);
-        setMessage(data.message || '');
         setStage(data.stage || '');
+        if (data.stage === 'vlm_image') {
+          setMessage(`🖼️ ${data.message || ''}`);
+        } else {
+          setMessage(data.message || '');
+        }
         setStatus('RUNNING');
       } else if (data.type === 'completed') {
         setStatus('SUCCESS');

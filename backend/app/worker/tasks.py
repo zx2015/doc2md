@@ -10,7 +10,6 @@ from app.core.database import SessionLocal
 from app.models.job import Job
 from app.models.document import Document
 from app.models.app_config import AppConfig
-from app.services.docling_service import run_docling_conversion
 from app.services.llm_service import clean_document_llm
 from app.core.security import decrypt_key
 from app.core.config import settings
@@ -42,35 +41,39 @@ def convert_task(job_id: str):
         job.progress_percent = 5
         job.started_at = datetime.now(timezone.utc)
         db.commit() # Commit first!
-        broadcast_progress(job_id, 5, "ocr", "Initializing Docling Conversion Engine...")
+        broadcast_progress(job_id, 5, "ocr", "Initializing MinerU Conversion Engine...")
         
         config = db.query(AppConfig).filter(AppConfig.id == 1).first()
         device_setting = config.device if config else "auto"
         use_llm_cleanup = True # assuming global enable or derived from options
         
-        # 2. Run Docling
-        # 默认关闭强制 OCR，以防数字版 PDF 原生文字被 LayoutLM 误识别为图像而覆盖丢失
-        do_ocr = job.options.get("do_ocr", False) if job.options else False
-        raw_md, result = run_docling_conversion(job.storage_input_path, device_setting=device_setting, do_ocr=do_ocr)
+        # 2. Run MinerU
+        from app.services.mineru_service import run_mineru_conversion
+        job_dir = os.path.dirname(job.storage_input_path)
+        
+        # We can pass job_dir to run_mineru_conversion to store images
+        raw_md, mineru_real_dir = run_mineru_conversion(job.storage_input_path, job_dir)
         
         # [Log Addition] 显式将原生的 raw.md 保存到磁盘供溯源排查
-        job_dir = os.path.dirname(job.storage_input_path)
-        raw_md_path = os.path.join(job_dir, "raw.md")
+        raw_md_path = os.path.join(mineru_real_dir, "raw.md")
         with open(raw_md_path, "w", encoding="utf-8") as f:
             f.write(raw_md)
             
-        image_count = len(re.findall(r'data:image/[a-zA-Z0-9]+;base64,', raw_md))
+
+            
+        # MinerU produces local image links like ![](images/xxx.jpg)
+        image_count = len(re.findall(r'!\[(.*?)\]\(images\/.*?\)', raw_md))
         estimated_vlm = image_count * 2
         
         job.options = {**(job.options or {}), "estimated_vlm_calls": estimated_vlm, "image_count": image_count}
         db.commit()
         broadcast_progress(job_id, 78, "vlm_image", f"Detected {image_count} images, {estimated_vlm} VLM calls")
 
-        # 3. Update progress after OCR
+        # 3. Update progress after Extraction
         job.progress_percent = 80
         job.progress_stage = "llm_cleanup"
         db.commit()
-        broadcast_progress(job_id, 80, "llm_cleanup", "Docling conversion complete. Cleaning up...")
+        broadcast_progress(job_id, 80, "llm_cleanup", "MinerU conversion complete. Cleaning up...")
         
         # 4. Optional LLM post-processing
         final_md = raw_md
@@ -89,6 +92,7 @@ def convert_task(job_id: str):
             from asgiref.sync import async_to_sync
             final_md = async_to_sync(clean_document_llm)(
                 raw_md=raw_md,
+                job_dir=mineru_real_dir,
                 api_key=decrypted_key,
                 base_url=config.llm_base_url,
                 model=config.vlm_model if job.options.get('use_vlm_image_reconstruction', False) else config.llm_model,
@@ -118,7 +122,10 @@ def convert_task(job_id: str):
             
         doc_record.markdown_content = final_md
         try:
-            doc_record.page_count = len(result.document.pages)
+            import fitz
+            doc_pdf = fitz.open(job.storage_input_path)
+            doc_record.page_count = len(doc_pdf)
+            doc_pdf.close()
         except Exception:
             doc_record.page_count = 1
         doc_record.metadata_json = {}

@@ -2,19 +2,13 @@ import os
 import sys
 from unittest.mock import MagicMock, AsyncMock
 
-sys.modules['docling_core'] = MagicMock()
-sys.modules['docling_core.transforms'] = MagicMock()
-sys.modules['docling_core.transforms.chunker'] = MagicMock()
-sys.modules['docling_core.transforms.chunker.hybrid_chunker'] = MagicMock()
-sys.modules['docling_core.types'] = MagicMock()
-sys.modules['docling_core.types.doc'] = MagicMock()
-sys.modules['docling_core.types.doc.document'] = MagicMock()
+
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 import pytest
 import asyncio
-from app.services.llm_service import clean_chunk, process_embedded_images
+from app.services.llm_service import clean_chunk
 from app.services.cleanup import collapse_whitespace
 
 def test_collapse_whitespace():

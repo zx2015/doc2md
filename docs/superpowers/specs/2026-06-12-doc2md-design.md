@@ -350,7 +350,7 @@ sequenceDiagram
     participant F as FastAPI
     participant R as Redis
     participant W as Celery Worker
-    participant D as Docling
+    participant M as MinerU
     participant L as LLM (OpenAI 兼容)
     participant DB as PostgreSQL
     participant FS as Local FS
@@ -366,15 +366,9 @@ sequenceDiagram
 
     W->>R: BLPOP convert queue
     W->>DB: UPDATE status=RUNNING, started_at
-    W->>D: DocumentConverter.convert(input)
-    loop 每页/每个阶段
-        D-->>W: 进度回调
-        W->>R: PUBLISH job:{id}:progress {stage, percent}
-        R-->>F: 转发
-        F-->>B: WS 帧
-    end
-    D-->>W: DoclingDocument
-    W->>W: 写出 .md 到 storage/{job_id}/raw.md
+    W->>M: run_mineru_conversion(input)
+    M-->>W: raw_md, mineru_real_dir
+    W->>W: 写出 raw_md 到 {mineru_real_dir}/raw.md
     W->>R: PUBLISH stage=llm_cleanup percent=80
 
     alt use_llm_cleanup=true
@@ -404,28 +398,24 @@ sequenceDiagram
     F-->>B: text/markdown
 ```
 
-### 5.1 Docling 转换引擎策略
-- **设备自动检测**：支持 `cuda`、`cpu` 和 `auto`。在 `auto` 模式下，代码会执行 `torch.cuda.is_available()`，若为 `True` 则实例化 `cuda` 设备。
-- **格式分流（Pipeline Selection）**：
-  - **StandardPdfPipeline**：应用于 `PDF`、`IMAGE`（.png, .jpg, .jpeg, .tiff, .bmp, .webp）。由于这些格式需要进行版面分析、表格识别和 OCR，必须配置 `StandardPdfPipeline`。
-  - **SimplePipeline**：应用于 `DOCX`、`PPTX`、`XLSX`、`HTML`、`EPUB` 等结构清晰、无需布局识别和 OCR 的文档格式。
-- **进度跟踪钩子**：Docling 的 `DocumentConverter` 支持注册自定义的 `PipelineDescriptor`。我们通过它拦截每一页的解析事件，计算出 `(当前页 / 总页数) * 100` 的进度值，并通过 Redis Pub/Sub 实时广播。
-- **图片提取配置（必须显式开启）**：使用 `StandardPdfPipeline` 处理 PDF/图片时，必须在 `PdfPipelineOptions` 中开启 `generate_picture_images = True`，否则 Docling 默认不提取文档内嵌图片，`ImageRefMode.EMBEDDED` 将退化为输出 `<!-- image -->` 占位符，导致 §5.2.6 的 VLM 图片重构管线静默失效。
+### 5.1 MinerU 转换引擎策略
+- **设备自动检测**：支持 `cuda`、`cpu` 和 `auto`。在 `auto` 模式下，代码会执行 `torch.cuda.is_available()`，若为 `True` 则实例化 `cuda` 设备。若 CUDA 初始化发生异常（例如显存 OOM 或驱动兼容性问题），将自动回退到 CPU 模式。
+- **命令行调用方式 (magic-pdf CLI)**：
+  通过 `subprocess.run` 异步执行 `/media/data/venv/bin/magic-pdf` CLI。设置超时时间（默认 600 秒）以防止任务无响应挂起。
+- **输出目录寻回**：
+  MinerU 转换后会在指定的 `output_dir` 下生成多层嵌套子目录（如 `{output_dir}/{pdf_name}/auto/`）。服务会通过 `Path.rglob("**/*.md")` 全局递归扫描并精确定位真实的 Markdown 文件及其图片保存文件夹（`images/`），解决路径错位问题。
+- **图片提取配置**：
+  MinerU 转换时会默认将 PDF/图片 中识别出的图表和插图抽取到 `images/` 子目录下，并将相对图片链接 `![](images/xxx.jpg)` 直接写入 Markdown。
 
   ```python
-  from docling.datamodel.pipeline_options import PdfPipelineOptions
-  from docling.document_converter import DocumentConverter, PdfFormatOption
-  from docling.datamodel.base_models import InputFormat
-
-  pipeline_options = PdfPipelineOptions()
-  pipeline_options.generate_picture_images = True   # 必须开启：提取文档内嵌图片
-  pipeline_options.generate_page_images = False     # 不需要全页截图
-
-  converter = DocumentConverter(
-      format_options={
-          InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
-      }
-  )
+  # MinerU 转换核心调用示例
+  cmd = [
+      "/media/data/venv/bin/magic-pdf",
+      "-p", pdf_path,
+      "-o", output_dir,
+      "-m", "auto"
+  ]
+  result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=timeout)
   ```
 
 ### 5.2 LLM 清洗管道设计
@@ -532,21 +522,23 @@ LLM 拿到该上下文后，**禁止**基于"上一块/下一块"是否存在来
 - 全 chunk 失败 → 整篇降级为仅空白合并
 - LLM 不确定 TOC/References → 保守保留，记录到 `jobs.options.warnings`
 
-#### 5.2.6 图片与图表：Base64 内联 + VLM 多步路由重构 ⚠️ 2026-06-12 (v1.0.5)
-为了解决传统图片提取带来的"多文件管理、裂图、静态反代依赖、下载需打包 ZIP"等严重痛点，并充分发挥多模态大模型 (VLM) 对图像的深度消费能力，系统采用 **Base64 内联 + VLM 多步分类与结构化重构** 管线。
+#### 5.2.6 图片与图表：本地图片路径 + VLM 实时读取与多步路由重构 ⚠️ 2026-06-13 (v1.1.0)
+为了充分发挥多模态大模型 (VLM) 对图像的深度消费能力，系统将 MinerU 抽取的本地图片相对地址链接与 VLM 多步分类结构化重构管线进行深度融合。
 
-**1) Docling 内联导出配置**
-- 在 `docling` 转换时，通过配置 `ImageRefMode.EMBEDDED`，强制将解析出的插图和图表以 Base64 格式直接内联写入 Markdown 文本中：
-  `![Figure](data:image/png;base64,iVBORw0KGgoAAA...)`
-- 这保证了转换产出的 Markdown 文件是 **100% 自包含（Self-contained）** 的单文件，无需静态资源服务器反代，无需 zip 打包，前端直接渲染，一键即可直接下载 `.md`。
+**1) MinerU 本地图片提取**
+- MinerU 转换时默认将文档中的插图和图表抽取到 `images/` 子目录下，并在 Markdown 中输出相对路径链接：
+  `![](images/xxx.jpg)`
+- 这种机制使得图片独立存放，相较于 Base64 极大降低了 Markdown 的文本大小，提升了首屏渲染与网络传输效率。
 
 **2) 双通道多步 VLM 重构管线**
-当用户开启 `use_vlm_image_reconstruction=true` 且配置了多模态模型时，Celery Worker 在拿到 `raw.md` 后，执行以下图像清洗管线：
+当用户开启 `use_vlm_image_reconstruction=true` 且配置了多模态模型时，Celery Worker 在拿到 `raw.md` 并通过 `rglob` 确定 `mineru_real_dir` 后，执行以下图像清洗管线：
 
 - **步骤 1：正则检测与提取**：
-  - 用正则 `!\[.*?\]\(data:image\/(?P<ext>png|jpeg|webp);base64,(?P<data>[a-zA-Z0-9+/=\s]+?)\)` 提取文档中所有的内联 Base64 图片数据。
+  - 用正则 `!\[(.*?)\]\((images\/[^\)]+\.(?P<ext>jpg|png|jpeg))(?:\s+"([^"]*)")?\)` 提取 Markdown 中所有的本地相对图片链接。
+  - 将相对路径拼接到 `mineru_real_dir` 得到图片在本地文件系统上的绝对路径。
 - **步骤 2：VLM 图像分类器（Classifier Channel）**：
-  - 将提取出的 Base64 图片发送给多模态 LLM。使用极低温（`temperature=0.0`）和高度约束的 Prompt，对图片进行 **8 分类** 判定，仅返回以下标签之一：
+  - 从本地读取图片并转换为 Base64，用以向多模态 LLM 发起 API 请求。
+  - 使用极低温（`temperature=0.0`）和高度约束的 Prompt，对图片进行 **8 分类** 判定，仅返回以下标签之一：
     - `table` (表格)
     - `flowchart_diagram` (流程/架构/思维导图)
     - `chart_graph` (折线/柱状/饼图/数据图)
@@ -567,11 +559,14 @@ LLM 拿到该上下文后，**禁止**基于"上一块/下一块"是否存在来
   - **`decorative` 路由**：直接剔除（返回空文本），过滤文档噪音。
 - **步骤 4：替换与集成（Replacement & Integration）**：
   根据用户偏好配置 `keep_original_images` 执行差异化合并：
-  - `keep_original_images = True`（保留原图，追加描述）：保留 Markdown 中的 Base64 标签，并在其紧随的下一行插入 VLM 转换后的文本/代码。
-  - `keep_original_images = False`（纯文本化，彻底替换）：**彻底删掉** `![Figure](base64)` 标签，替换为 VLM 转换后的文本/代码。**这能使文档体积缩小 90% 以上，极度适合 RAG 大模型消费**。
+  - `keep_original_images = True`（保留原图，追加描述）：保留 Markdown 中的本地相对图片链接标签，并在其紧随的下一行插入 VLM 转换后的文本/代码。
+  - `keep_original_images = False`（纯文本化，彻底替换）：**彻底删掉**相对路径标签，替换为 VLM 转换后的文本/代码。
+- **步骤 5：回填与写出**：
+  Worker 将重构后的文本/代码回填替换，生成最终清洗的 output.md。
 
 **3) 降级策略**
-- 分类器调用失败 → 保持原样（保留 Base64 标签，记录 warning）。
+- 图片未找到 → 输出 `![Image Not Found](images/xxx.jpg)`，并在日志中记录警告。
+- 分类器调用失败 → 保持原样（保留相对图片标签，记录 warning）。
 - 路由重构调用失败 → 退回到 `photo_illustration` 路由做基础描述，若仍失败则保持原样。
 
 ---
