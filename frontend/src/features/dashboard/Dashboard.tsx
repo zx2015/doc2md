@@ -9,6 +9,13 @@ type QueueItem = {
   error?: string;
 };
 
+// Fallback for insecure contexts (HTTP) where crypto.randomUUID is undefined
+const generateId = () => {
+  return typeof crypto !== 'undefined' && crypto.randomUUID 
+    ? crypto.randomUUID() 
+    : Math.random().toString(36).substring(2, 15) + Date.now().toString(36);
+};
+
 export default function Dashboard({ onJobComplete }: { onJobComplete?: (jobId: string) => void }) {
   const [uploadQueue, setUploadQueue] = useState<QueueItem[]>([]);
   const [isUploading, setIsUploading] = useState(false);
@@ -157,7 +164,7 @@ export default function Dashboard({ onJobComplete }: { onJobComplete?: (jobId: s
               return;
             }
             const newItems: QueueItem[] = files.map(f => ({
-              id: crypto.randomUUID(),
+              id: generateId(),
               file: f,
               status: 'pending',
             }));
