@@ -1,16 +1,32 @@
-import React, { useState } from 'react';
-import useWebSocket from 'react-use-websocket';
-import { UploadCloud, FileText, CheckCircle, AlertCircle } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { UploadCloud, CheckCircle, Clock, Loader, XCircle } from 'lucide-react';
+
+type QueueItem = {
+  id: string;
+  file: File;
+  status: 'pending' | 'uploading' | 'queued' | 'failed';
+  jobId?: string;
+  error?: string;
+};
 
 export default function Dashboard({ onJobComplete }: { onJobComplete?: (jobId: string) => void }) {
-  const [file, setFile] = useState<File | null>(null);
-  const [jobId, setJobId] = useState<string | null>(null);
-  const [status, setStatus] = useState<string>('');
-  const [progress, setProgress] = useState<number>(0);
-  const [message, setMessage] = useState<string>('');
-  const [stage, setStage] = useState<string>('');
+  const [uploadQueue, setUploadQueue] = useState<QueueItem[]>([]);
+  const [isUploading, setIsUploading] = useState(false);
+
   const [recentJobs, setRecentJobs] = useState<any[]>([]);
   const [selectedJobs, setSelectedJobs] = useState<Set<string>>(new Set());
+
+  // 意外离开保护
+  useEffect(() => {
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      if (isUploading) {
+        e.preventDefault();
+        e.returnValue = '';
+      }
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [isUploading]);
 
   const fetchRecentJobs = () => {
     fetch('/api/v1/jobs?limit=20')
@@ -50,158 +66,201 @@ export default function Dashboard({ onJobComplete }: { onJobComplete?: (jobId: s
 
   React.useEffect(() => {
     fetchRecentJobs();
-  }, [status]);
+  }, []); // Only on mount, we will poll manually or rely on events
 
-  const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const { lastJsonMessage } = useWebSocket(
-    jobId ? `${wsProtocol}//${window.location.host}/api/v1/ws/jobs/${jobId}` : null,
-    {
-      onOpen: () => console.log('WS connected'),
-      shouldReconnect: () => {
-        return status === 'PENDING' || status === 'RUNNING';
-      },
-      reconnectAttempts: 10,
-      reconnectInterval: (attempt) => Math.min(30000, 1000 * 2 ** attempt),
-    }
-  );
-
-  React.useEffect(() => {
-    if (lastJsonMessage) {
-      const data = lastJsonMessage as any;
-      if (data.type === 'snapshot' || data.type === 'progress') {
-        setProgress(data.percent || 0);
-        setStage(data.stage || '');
-        if (data.stage === 'vlm_image') {
-          setMessage(`🖼️ ${data.message || ''}`);
-        } else {
-          setMessage(data.message || '');
-        }
-        setStatus('RUNNING');
-      } else if (data.type === 'completed') {
-        setStatus('SUCCESS');
-        setProgress(100);
-        setMessage('Conversion complete!');
-        if (onJobComplete) onJobComplete(data.job_id);
-      } else if (data.type === 'failed') {
-        setStatus('FAILED');
-        setMessage(data.error || 'Failed');
-      }
-    }
-  }, [lastJsonMessage, onJobComplete]);
+  // Poll recent jobs every 3 seconds to update statuses
+  useEffect(() => {
+    const interval = setInterval(fetchRecentJobs, 3000);
+    return () => clearInterval(interval);
+  }, []);
 
   const [useVlm, setUseVlm] = useState(false);
+  const [llmAggressiveness, setLlmAggressiveness] = useState('balanced');
+  const [enableLlm, setEnableLlm] = useState(false);
 
+  const updateQueueItem = (id: string, patch: Partial<QueueItem>) => {
+    setUploadQueue(prev =>
+      prev.map(i => i.id === id ? { ...i, ...patch } : i)
+    );
+  };
 
-  const handleUpload = async () => {
-    if (!file) return;
-    const formData = new FormData();
-    formData.append('file', file);
-    formData.append('options', JSON.stringify({ 
-      device: 'auto',
-      use_vlm_image_reconstruction: useVlm
-    }));
+  const removeFromQueue = (id: string) => {
+    setUploadQueue(prev => prev.filter(i => i.id !== id));
+  };
 
-    try {
-      const res = await fetch('/api/v1/jobs', {
-        method: 'POST',
-        body: formData,
-      });
-      const data = await res.json();
-      if (res.ok) {
-        setJobId(data.job_id);
-        setStatus('PENDING');
-        setProgress(0);
-        setMessage('Job accepted, waiting for worker...');
-      } else {
-        alert("Upload failed: " + data.detail);
+  const startSequentialUpload = async () => {
+    setIsUploading(true);
+    const pendingItems = uploadQueue.filter(i => i.status === 'pending');
+
+    for (const item of pendingItems) {
+      updateQueueItem(item.id, { status: 'uploading' });
+
+      try {
+        const formData = new FormData();
+        formData.append('file', item.file);
+        
+        const options: any = {
+          device: 'auto',
+          use_vlm_image_reconstruction: useVlm,
+        };
+        if (enableLlm) {
+          options.llm_cleanup_aggressiveness = llmAggressiveness;
+        }
+        
+        formData.append('options', JSON.stringify(options));
+
+        const res = await fetch('/api/v1/jobs', {
+          method: 'POST',
+          body: formData,
+        });
+
+        if (!res.ok) {
+          const err = await res.text();
+          throw new Error(`HTTP ${res.status}: ${err}`);
+        }
+
+        const data = await res.json();
+        updateQueueItem(item.id, { status: 'queued', jobId: data.job_id });
+      } catch (e: any) {
+        updateQueueItem(item.id, { status: 'failed', error: e.message });
       }
-    } catch (err) {
-      console.error(err);
-      alert("Network error");
+
+      await new Promise(r => setTimeout(r, 100));
+      fetchRecentJobs();
     }
+
+    setIsUploading(false);
+  };
+
+  const retryItem = async (id: string) => {
+    updateQueueItem(id, { status: 'pending', error: undefined });
+    setTimeout(() => startSequentialUpload(), 0);
   };
 
   return (
-    <div className="max-w-3xl mx-auto p-6 space-y-8">
+    <div className="max-w-4xl mx-auto p-6 space-y-8">
       <div className="bg-white p-8 rounded-2xl shadow-sm border border-gray-100 flex flex-col items-center justify-center border-dashed border-2">
         <UploadCloud className="w-16 h-16 text-blue-500 mb-4" />
-        <h3 className="text-xl font-bold text-gray-800 mb-2">Upload Document</h3>
-        <p className="text-gray-500 mb-6 text-center">Support PDF, DOCX, PPTX and Images</p>
+        <h3 className="text-xl font-bold text-gray-800 mb-2">Upload Documents</h3>
+        <p className="text-gray-500 mb-6 text-center">Drag & Drop multiple files or click to select.<br/>Support PDF, DOCX, PPTX, PNG, JPG</p>
         
         <input 
           type="file" 
           id="fileInput" 
+          multiple
+          accept=".pdf,.docx,.pptx,.png,.jpg,.jpeg"
           className="hidden" 
-          onChange={(e) => setFile(e.target.files?.[0] || null)} 
+          onChange={(e) => {
+            const files = Array.from(e.target.files || []);
+            if (uploadQueue.length + files.length > 50) {
+              alert('队列上限为 50 个文件，请分批上传');
+              return;
+            }
+            const newItems: QueueItem[] = files.map(f => ({
+              id: crypto.randomUUID(),
+              file: f,
+              status: 'pending',
+            }));
+            setUploadQueue(prev => [...prev, ...newItems]);
+            e.target.value = '';
+          }} 
         />
         <label 
           htmlFor="fileInput" 
           className="cursor-pointer px-6 py-3 bg-blue-600 text-white rounded-xl hover:bg-blue-700 transition"
         >
-          Select File
+          Select Files
         </label>
-        {file && <div className="mt-4 text-sm text-gray-600 flex items-center gap-2"><FileText className="w-4 h-4"/> {file.name}</div>}
       </div>
 
       <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100">
         <h4 className="font-semibold text-gray-800 mb-4">Conversion Options</h4>
-        <div className="space-y-3">
+        <div className="space-y-4">
           <label className="flex items-center gap-3">
             <input type="checkbox" checked={useVlm} onChange={e => setUseVlm(e.target.checked)} className="w-4 h-4 text-blue-600" />
             <span className="text-gray-700">Enable VLM Image Reconstruction (Requires Vision Model)</span>
           </label>
+          
+          <label className="flex items-center gap-3">
+            <input type="checkbox" checked={enableLlm} onChange={e => setEnableLlm(e.target.checked)} className="w-4 h-4 text-blue-600" />
+            <span className="text-gray-700">Enable LLM Smart Cleanup</span>
+          </label>
+          
+          {enableLlm && (
+            <div className="ml-7 flex items-center gap-3">
+              <span className="text-sm text-gray-600">Aggressiveness:</span>
+              <select 
+                value={llmAggressiveness} 
+                onChange={e => setLlmAggressiveness(e.target.value)}
+                className="text-sm border border-gray-300 rounded px-2 py-1 outline-none focus:border-blue-500"
+              >
+                <option value="conservative">Conservative</option>
+                <option value="balanced">Balanced</option>
+                <option value="aggressive">Aggressive</option>
+              </select>
+            </div>
+          )}
         </div>
       </div>
 
-      {file && !jobId && (
-        <button 
-          onClick={handleUpload}
-          className="w-full py-4 bg-gray-900 text-white rounded-xl font-semibold hover:bg-gray-800 transition"
-        >
-          Start Conversion
-        </button>
-      )}
-
-      {jobId && (
+      {uploadQueue.length > 0 && (
         <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100">
           <div className="flex justify-between items-center mb-4">
-            <h4 className="font-semibold text-gray-800">Job: {jobId.split('-')[0]}...</h4>
-            <span className={`px-3 py-1 rounded-full text-xs font-semibold ${status === 'SUCCESS' ? 'bg-green-100 text-green-700' : status === 'FAILED' ? 'bg-red-100 text-red-700' : 'bg-blue-100 text-blue-700'}`}>
-              {status}
-            </span>
-          </div>
-          
-          <div className="w-full bg-gray-100 rounded-full h-3 mb-4 overflow-hidden">
-            <div 
-              className={`h-3 rounded-full transition-all duration-500 ${status === 'FAILED' ? 'bg-red-500' : 'bg-blue-500'}`}
-              style={{ width: `${progress}%` }}
-            ></div>
-          </div>
-          
-          <div className="flex items-center gap-2 text-sm text-gray-600">
-            {status === 'SUCCESS' && <CheckCircle className="w-4 h-4 text-green-500" />}
-            {status === 'FAILED' && <AlertCircle className="w-4 h-4 text-red-500" />}
-            {status === 'RUNNING' && stage === 'vlm_image' ? (
-              <div className="w-4 h-4 border-2 border-purple-500 border-t-transparent rounded-full animate-spin"></div>
-            ) : status === 'RUNNING' && (
-              <div className="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
-            )}
-            <p className={stage === 'vlm_image' ? "text-purple-600 font-medium" : ""}>{message || 'Initializing...'}</p>
-          </div>
-          {(status === 'SUCCESS' || status === 'FAILED') && (
+            <h4 className="font-semibold text-gray-800">Upload Queue ({uploadQueue.length})</h4>
             <button 
-              onClick={() => { setJobId(null); setFile(null); setStatus(''); setProgress(0); setMessage(''); }}
-              className="mt-4 px-4 py-2 bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 transition text-sm font-medium"
+              onClick={() => setUploadQueue([])} 
+              disabled={isUploading}
+              className="text-sm text-red-500 hover:text-red-700 disabled:opacity-50"
             >
-              Upload Another
+              Clear Queue
             </button>
-          )}
+          </div>
+
+          <div className="space-y-2 mb-4 max-h-64 overflow-y-auto pr-2">
+            {uploadQueue.map(item => (
+              <div key={item.id} className="flex justify-between items-center p-3 border rounded-lg bg-gray-50">
+                <div className="flex items-center gap-3">
+                  {item.status === 'pending'   && <Clock className="w-4 h-4 text-gray-500" />}
+                  {item.status === 'uploading' && <Loader className="w-4 h-4 text-blue-500 animate-spin" />}
+                  {item.status === 'queued'    && <CheckCircle className="w-4 h-4 text-green-500" />}
+                  {item.status === 'failed'    && <XCircle className="w-4 h-4 text-red-500" />}
+                  
+                  <div className="flex flex-col">
+                    <span className="font-medium text-sm text-gray-800 truncate max-w-[300px]">{item.file.name}</span>
+                    <span className="text-xs text-gray-500">{(item.file.size / 1024 / 1024).toFixed(1)} MB</span>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-3">
+                  {item.status === 'failed' && (
+                    <span className="text-xs text-red-500 max-w-[200px] truncate">{item.error}</span>
+                  )}
+                  {item.status === 'pending' && !isUploading && (
+                    <button onClick={() => removeFromQueue(item.id)} className="text-xs text-gray-500 hover:text-red-500">Remove</button>
+                  )}
+                  {item.status === 'failed' && !isUploading && (
+                    <button onClick={() => retryItem(item.id)} className="text-xs text-blue-500 hover:text-blue-700">Retry</button>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div className="flex justify-end gap-3">
+            <button
+              className="px-6 py-2 bg-gray-900 text-white rounded-lg font-medium hover:bg-gray-800 transition disabled:opacity-50 flex items-center justify-center min-w-[120px]"
+              onClick={startSequentialUpload}
+              disabled={isUploading || uploadQueue.filter(i => i.status === 'pending').length === 0}
+            >
+              {isUploading ? <><Loader className="w-4 h-4 mr-2 animate-spin" /> Uploading...</> : 'Start Conversion'}
+            </button>
+          </div>
         </div>
       )}
 
       <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100">
         <div className="flex justify-between items-center mb-4">
-          <h4 className="font-semibold text-gray-800">Recent Conversions</h4>
+          <h4 className="font-semibold text-gray-800">Job Board</h4>
           {selectedJobs.size > 0 && (
             <button 
               onClick={handleBatchDelete}
@@ -235,7 +294,12 @@ export default function Dashboard({ onJobComplete }: { onJobComplete?: (jobId: s
                   </div>
                 </div>
                 <div className="flex items-center gap-3">
-                  <span className={`px-2 py-1 rounded-md text-[10px] font-bold ${job.status === 'SUCCESS' ? 'bg-green-100 text-green-700' : job.status === 'FAILED' ? 'bg-red-100 text-red-700' : 'bg-blue-100 text-blue-700'}`}>
+                  <span className={`px-2 py-1 rounded-md text-[10px] font-bold flex items-center gap-1 ${
+                    job.status === 'SUCCESS' ? 'bg-green-100 text-green-700' : 
+                    job.status === 'FAILED' ? 'bg-red-100 text-red-700' : 
+                    'bg-blue-100 text-blue-700'
+                  }`}>
+                    {job.status === 'RUNNING' || job.status === 'PENDING' ? <Loader className="w-3 h-3 animate-spin" /> : null}
                     {job.status}
                   </span>
                   <div className="flex gap-2">
