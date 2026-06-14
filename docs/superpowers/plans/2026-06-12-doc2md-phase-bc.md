@@ -1054,6 +1054,12 @@ doc2md/
   Run: `systemctl status doc2md-api doc2md-worker`
   Expected: Both services active and running without errors on x-server.
 
+- [ ] **Step 4: Nginx 配置与重载 (⚠️ v1.2 补全)**
+  将设计文档 §7.3 的 Nginx 反向代理配置段落，复制到 `/etc/nginx/conf.d/doc2md.conf` 中。
+  确保 `location /api/v1/ws` 路径**无尾斜杠**。
+  Run: `nginx -t`
+  Run: `systemctl reload nginx`
+
 ---
 
 ## Task 12: v1.1 增量补丁（post-v1.0.7 设计同步）
@@ -1411,6 +1417,18 @@ type QueueItem = {
 // Dashboard 新增状态
 const [uploadQueue, setUploadQueue] = useState<QueueItem[]>([]);
 const [isUploading, setIsUploading] = useState(false);  // 防止重复提交
+
+// 意外离开保护 (⚠️ v1.2.0 新增)
+useEffect(() => {
+  const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+    if (isUploading) {
+      e.preventDefault();
+      e.returnValue = ''; // Chrome 需要此行
+    }
+  };
+  window.addEventListener('beforeunload', handleBeforeUnload);
+  return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+}, [isUploading]);
 ```
 
 ### 13.3 前端组件改动（`Dashboard.tsx`）
@@ -1428,6 +1446,10 @@ const [isUploading, setIsUploading] = useState(false);  // 防止重复提交
   accept=".pdf,.docx,.pptx,.png,.jpg,.jpeg"
   onChange={(e) => {
     const files = Array.from(e.target.files || []);
+    if (uploadQueue.length + files.length > 50) {
+      alert('队列上限为 50 个文件，请分批上传');
+      return;
+    }
     const newItems: QueueItem[] = files.map(f => ({
       id: crypto.randomUUID(),
       file: f,
@@ -1455,11 +1477,11 @@ const [isUploading, setIsUploading] = useState(false);  // 防止重复提交
 
     {uploadQueue.map(item => (
       <div key={item.id} className="queue-item">
-        {/* 状态图标 */}
-        {item.status === 'pending'   && <span className="icon-pending">○</span>}
-        {item.status === 'uploading' && <span className="icon-uploading">⟳</span>}
-        {item.status === 'queued'    && <span className="icon-queued text-green-500">✓</span>}
-        {item.status === 'failed'    && <span className="icon-failed text-red-500">✗</span>}
+        {/* 状态图标 (统一使用 lucide-react) */}
+        {item.status === 'pending'   && <Clock className="w-4 h-4 text-gray-500" />}
+        {item.status === 'uploading' && <Loader className="w-4 h-4 text-blue-500 animate-spin" />}
+        {item.status === 'queued'    && <CheckCircle className="w-4 h-4 text-green-500" />}
+        {item.status === 'failed'    && <XCircle className="w-4 h-4 text-red-500" />}
 
         {/* 文件信息 */}
         <span className="filename">{item.file.name}</span>
@@ -1534,6 +1556,9 @@ const startSequentialUpload = async () => {
       // 4. 失败：记录错误，继续下一个
       updateQueueItem(item.id, { status: 'failed', error: e.message });
     }
+    
+    // 速率控制：每完成一个文件停顿 100ms，避免占用主线程 (⚠️ v1.2.0)
+    await new Promise(r => setTimeout(r, 100));
   }
 
   setIsUploading(false);
@@ -1574,8 +1599,11 @@ const retryItem = async (id: string) => {
 ### 13.5 部署步骤
 
 ```bash
-# 本地构建
+# 本地构建前执行前端测试
 cd /media/data/git/doc2md/frontend
+npm run test
+
+# 构建
 npm run build
 
 # 同步到 x-server
