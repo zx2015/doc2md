@@ -81,7 +81,6 @@ export default function Dashboard({ onJobComplete }: { onJobComplete?: (jobId: s
     return () => clearInterval(interval);
   }, []);
 
-  const [useVlm, setUseVlm] = useState(false);
   const [llmAggressiveness, setLlmAggressiveness] = useState('balanced');
   const [enableLlm, setEnableLlm] = useState(false);
 
@@ -108,7 +107,7 @@ export default function Dashboard({ onJobComplete }: { onJobComplete?: (jobId: s
         
         const options: any = {
           device: 'auto',
-          use_vlm_image_reconstruction: useVlm,
+          use_vlm_image_reconstruction: true,
         };
         if (enableLlm) {
           options.llm_cleanup_aggressiveness = llmAggressiveness;
@@ -183,11 +182,6 @@ export default function Dashboard({ onJobComplete }: { onJobComplete?: (jobId: s
       <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100">
         <h4 className="font-semibold text-gray-800 mb-4">Conversion Options</h4>
         <div className="space-y-4">
-          <label className="flex items-center gap-3">
-            <input type="checkbox" checked={useVlm} onChange={e => setUseVlm(e.target.checked)} className="w-4 h-4 text-blue-600" />
-            <span className="text-gray-700">Enable VLM Image Reconstruction (Requires Vision Model)</span>
-          </label>
-          
           <label className="flex items-center gap-3">
             <input type="checkbox" checked={enableLlm} onChange={e => setEnableLlm(e.target.checked)} className="w-4 h-4 text-blue-600" />
             <span className="text-gray-700">Enable LLM Smart Cleanup</span>
